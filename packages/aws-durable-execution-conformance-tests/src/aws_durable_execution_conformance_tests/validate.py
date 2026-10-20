@@ -728,48 +728,64 @@ class PollingValidator:
                     )
                     break
 
-            # Handle new CallbackStarted events
-            new_callbacks: list[dict[str, Any]] = extract_callback_events(actual_events, handled_callback_ids)
-            for cb_event in new_callbacks:
-                details: dict[str, Any] = cb_event.get("CallbackStartedDetails", {})
-                callback_id: str = details.get("CallbackId", "")
+            # Serve every known callback once before any heartbeat follow-up.
+            # This preserves the first round's action matching and prevents a
+            # delayed follow-up from starving another callback in the batch.
+            callback_round: list[dict[str, Any]] = extract_callback_events(actual_events, handled_callback_ids)
+            initial_round = True
+            while callback_round:
+                heartbeat_followups: list[dict[str, Any]] = []
+                for cb_event in callback_round:
+                    details: dict[str, Any] = cb_event.get("CallbackStartedDetails", {})
+                    callback_id: str = details.get("CallbackId", "")
 
-                action, idx = find_matching_action(cb_event, actions, used_action_indices, self._context)
-                if action is None:
-                    if not actions:
-                        # No actions configured — timeout test, expected behaviour
-                        print(
-                            f"  No CallbackAction configured for"
-                            f" '{cb_event.get('Name', '<anonymous>')}'; leaving callback open"
+                    action, idx = find_matching_action(cb_event, actions, used_action_indices, self._context)
+                    if action is None:
+                        if not initial_round:
+                            # Retain the normal next-poll unmatched-action error
+                            # when a heartbeat has no configured follow-up.
+                            continue
+                        if not actions:
+                            # No actions configured — timeout test, expected behaviour
+                            print(
+                                f"  No CallbackAction configured for"
+                                f" '{cb_event.get('Name', '<anonymous>')}'; leaving callback open"
+                            )
+                        else:
+                            event_name: str = cb_event.get("Name", "<anonymous>")
+                            errors.append(f"No matching CallbackAction for callback '{event_name}' (id={callback_id})")
+                        handled_callback_ids.add(callback_id)
+                        continue
+
+                    if idx is not None:
+                        used_action_indices.add(idx)
+
+                    # Only a terminal action consumes the callback.
+                    if action.operation != "heartbeat":
+                        handled_callback_ids.add(callback_id)
+
+                    try:
+                        if action.delay_seconds > 0:
+                            time.sleep(action.delay_seconds)
+                        resolved_action: CallbackAction = CallbackAction(
+                            callback_name=action.callback_name,
+                            operation=action.operation,
+                            payload=self._context.substitute(action.payload),
                         )
-                    else:
-                        event_name: str = cb_event.get("Name", "<anonymous>")
-                        errors.append(f"No matching CallbackAction for callback '{event_name}' (id={callback_id})")
-                    handled_callback_ids.add(callback_id)
-                    continue
+                        self._callback_sender.send(callback_id, resolved_action)
+                        callbacks_sent += 1
+                        print(f"  Sent {action.operation} callback for '{action.callback_name}' (id={callback_id})")
+                    except CallbackError as e:
+                        errors.append(str(e))
+                        continue
 
-                if idx is not None:
-                    used_action_indices.add(idx)
+                    if action.operation == "heartbeat":
+                        heartbeat_followups.append(cb_event)
 
-                # Heartbeat is a keep-alive, not terminal — don't
-                # consume the callback so it remains matchable for a
-                # follow-up success/failure action.
-                if action.operation != "heartbeat":
-                    handled_callback_ids.add(callback_id)
-
-                try:
-                    if action.delay_seconds > 0:
-                        time.sleep(action.delay_seconds)
-                    resolved_action: CallbackAction = CallbackAction(
-                        callback_name=action.callback_name,
-                        operation=action.operation,
-                        payload=self._context.substitute(action.payload),
-                    )
-                    self._callback_sender.send(callback_id, resolved_action)
-                    callbacks_sent += 1
-                    print(f"  Sent {action.operation} callback for '{action.callback_name}' (id={callback_id})")
-                except CallbackError as e:
-                    errors.append(str(e))
+                # A heartbeat produces no history event. Dispatch its known
+                # follow-up in the next round before a potentially slow fetch.
+                callback_round = heartbeat_followups
+                initial_round = False
 
             # In history-only mode, stop polling once all expected
             # events are matched rather than waiting for terminal status.
