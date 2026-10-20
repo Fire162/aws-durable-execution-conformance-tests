@@ -300,3 +300,182 @@ def test_heartbeat_without_followup_keeps_existing_unmatched_action_error(monkey
     assert result.callbacks_sent == 1
     assert service.attempts == [("heartbeat", "callback", 2, None)]
     assert service.outcomes == {"callback": "CallbackTimedOut"}
+
+
+class _StopConditionService(_CallbackService):
+    def __init__(
+        self,
+        clock: _Clock,
+        *,
+        names: tuple[str, ...] = ("first", "second"),
+        finish_on_second: str | None = None,
+        stale_history_reads: int = 0,
+        fail_status: bool = False,
+        history_retry_delay: float = 0,
+    ) -> None:
+        super().__init__(clock, names=names, history_retry_delay=history_retry_delay)
+        self.finish_on_second = finish_on_second
+        self.finished: str | None = None
+        self.stale_history_reads = stale_history_reads
+        self.fail_status = fail_status
+        self.status_reads = 0
+
+    def _status(self) -> str:
+        return self.finished or super()._status()
+
+    def _send(self, operation: str, callback_id: str, payload: Any = None) -> dict[str, Any]:
+        if self.finished:
+            self.attempts.append((operation, callback_id, self.clock.now, payload))
+            raise ClientError(
+                {"Error": {"Code": "InvalidParameterValueException", "Message": "execution already finished"}},
+                "SendDurableExecutionCallback" + operation.title(),
+            )
+        response = super()._send(operation, callback_id, payload)
+        if callback_id == "second" and operation != "heartbeat":
+            self.finished = self.finish_on_second
+        return response
+
+    def get_durable_execution(self, **_kwargs: Any) -> dict[str, Any]:
+        self.status_reads += 1
+        if self.fail_status:
+            raise ClientError(
+                {"Error": {"Code": "ServiceException", "Message": "status unavailable"}},
+                "GetDurableExecution",
+            )
+        return super().get_durable_execution()
+
+    def get_durable_execution_history(self, **_kwargs: Any) -> dict[str, Any]:
+        response = super().get_durable_execution_history()
+        if self.finished and self.stale_history_reads:
+            self.stale_history_reads -= 1
+            response["ExecutionStatus"] = "RUNNING"
+            response["Events"] = [event for event in response["Events"] if event["EventType"] == "CallbackStarted"]
+        elif self._status() in {"SUCCEEDED", "FAILED"}:
+            response["Events"].append(
+                {"EventType": "ExecutionSucceeded" if self._status() == "SUCCEEDED" else "ExecutionFailed"}
+            )
+        for i, event in enumerate(response["Events"], 1):
+            event["EventId"] = i
+        return response
+
+
+def test_history_only_completion_stops_before_heartbeat_followup(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = _StopConditionService(_Clock(), names=("callback",))
+    monkeypatch.setattr(validation, "time", service.clock)
+
+    result = validation.PollingValidator(service).validate(
+        execution_arn="arn:test:execution",
+        expected_events=[{"EventType": "CallbackStarted", "EventId": 1, "Name": "callback"}],
+        expected_result=None,
+        callback_actions=[CallbackAction("*", "heartbeat"), CallbackAction("*", "success", "must not send", 1)],
+    )
+
+    assert result.passed, result.errors
+    assert result.final_status == "RUNNING"
+    assert result.callbacks_sent == 1
+    assert service.attempts == [("heartbeat", "callback", 2, None)]
+    assert service.history_reads == 1
+    assert service.status_reads == 0
+
+
+@pytest.mark.parametrize("terminal_status", ["SUCCEEDED", "FAILED"])
+@pytest.mark.parametrize("stale_history_reads", [0, 1])
+def test_early_terminal_execution_stops_followups_and_still_validates_final_history(
+    monkeypatch: pytest.MonkeyPatch, terminal_status: str, stale_history_reads: int
+) -> None:
+    service = _StopConditionService(_Clock(), finish_on_second=terminal_status, stale_history_reads=stale_history_reads)
+    monkeypatch.setattr(validation, "time", service.clock)
+    success = terminal_status == "SUCCEEDED"
+    operation = "success" if success else "failure"
+    payload: Any = "second result" if success else {"ErrorType": "ExternalFailure"}
+    result = validation.PollingValidator(service).validate(
+        execution_arn="arn:test:execution",
+        expected_events=[
+            {"EventType": "CallbackStarted", "EventId": 1, "Name": "first"},
+            {"EventType": "CallbackStarted", "EventId": 2, "Name": "second"},
+            {"EventType": "CallbackSucceeded" if success else "CallbackFailed", "EventId": 3, "Name": "second"},
+            {"EventType": "ExecutionSucceeded" if success else "ExecutionFailed", "EventId": 4},
+        ],
+        expected_result={"ExecutionStatus": terminal_status},
+        callback_actions=[
+            CallbackAction("first", "heartbeat"),
+            CallbackAction("first", "success", "must not send", 1),
+            CallbackAction("second", operation, payload),
+        ],
+    )
+
+    assert result.passed, result.errors
+    assert result.final_status == terminal_status
+    assert result.callbacks_sent == 2
+    assert service.attempts == [("heartbeat", "first", 2, None), (operation, "second", 2, payload)]
+    assert service.history_reads == 2 + stale_history_reads
+    assert service.status_reads == 2  # Dispatch gate, then final result assertion.
+    assert result.event_count == 4
+
+
+@pytest.mark.parametrize("history_retry_delay", [10, 25])
+def test_nonterminal_status_probe_does_not_wait_for_history_before_followup(
+    monkeypatch: pytest.MonkeyPatch, history_retry_delay: float
+) -> None:
+    service = _StopConditionService(_Clock(), history_retry_delay=history_retry_delay)
+
+    result = _validate(
+        monkeypatch,
+        service,
+        [
+            CallbackAction("first", "heartbeat"),
+            CallbackAction("first", "success", "first result", 1),
+            CallbackAction("second", "success", "second result"),
+        ],
+    )
+
+    assert result.passed, result.errors
+    assert service.attempts == [
+        ("heartbeat", "first", 2, None),
+        ("success", "second", 2, "second result"),
+        ("success", "first", 3, "first result"),
+    ]
+    assert service.history_reads == 2
+    assert service.status_reads == 2
+
+
+def test_status_probe_failure_stops_dispatch_and_reports_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = _StopConditionService(_Clock(), fail_status=True)
+
+    result = _validate(
+        monkeypatch,
+        service,
+        [
+            CallbackAction("first", "heartbeat"),
+            CallbackAction("first", "success", "must not send", 1),
+            CallbackAction("second", "success", "second result"),
+        ],
+    )
+
+    assert not result.passed
+    assert result.errors == ["Failed to retrieve execution status before callback follow-up"]
+    assert result.callbacks_sent == 2
+    assert service.attempts == [("heartbeat", "first", 2, None), ("success", "second", 2, "second result")]
+    assert service.history_reads == 1
+    assert service.status_reads == 1
+
+
+def test_history_only_completion_is_checked_without_callback_events(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = _StopConditionService(_Clock())
+    event = {"EventType": "StepStarted", "EventId": 1, "Name": "ordinary-step"}
+    monkeypatch.setattr(validation, "time", service.clock)
+    monkeypatch.setattr(
+        service, "get_durable_execution_history", lambda **_kwargs: {"ExecutionStatus": "RUNNING", "Events": [event]}
+    )
+
+    result = validation.PollingValidator(service).validate(
+        execution_arn="arn:test:execution",
+        expected_events=[event],
+        expected_result=None,
+    )
+
+    assert result.passed, result.errors
+    assert result.final_status == "RUNNING"
+    assert result.callbacks_sent == 0
+    assert service.attempts == []
+    assert service.status_reads == 0

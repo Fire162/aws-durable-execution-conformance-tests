@@ -692,6 +692,7 @@ class PollingValidator:
         final_status: str | None = None
         actual_events: list[dict[str, Any]] = []
         history_only_mode: bool = expected_result is None
+        execution_terminal = False
 
         while True:
             time.sleep(self._config.poll_interval_seconds)
@@ -731,10 +732,13 @@ class PollingValidator:
             # Serve every known callback once before any heartbeat follow-up.
             # This preserves the first round's action matching and prevents a
             # delayed follow-up from starving another callback in the batch.
-            callback_round: list[dict[str, Any]] = extract_callback_events(actual_events, handled_callback_ids)
+            callback_round: list[dict[str, Any]] = (
+                [] if execution_terminal else extract_callback_events(actual_events, handled_callback_ids)
+            )
             initial_round = True
-            while callback_round:
+            while True:
                 heartbeat_followups: list[dict[str, Any]] = []
+                terminal_callback_sent = False
                 for cb_event in callback_round:
                     details: dict[str, Any] = cb_event.get("CallbackStartedDetails", {})
                     callback_id: str = details.get("CallbackId", "")
@@ -781,26 +785,52 @@ class PollingValidator:
 
                     if action.operation == "heartbeat":
                         heartbeat_followups.append(cb_event)
+                    else:
+                        terminal_callback_sent = True
+
+                # Preserve the old history-only boundary after the first round,
+                # before another action changes an already-matched execution.
+                # Also check when no callbacks were available in this history.
+                if history_only_mode and expected_events:
+                    matcher = EventHistoryMatcher(context=self._context)
+                    match_result = matcher.match(expected_events, actual_events)
+                    if match_result.success:
+                        return AsyncValidationResult(
+                            passed=True,
+                            errors=[],
+                            placeholders=match_result.resolved_placeholders,
+                            callbacks_sent=callbacks_sent,
+                            final_status=final_status,
+                            event_count=len(actual_events),
+                        )
+
+                if not heartbeat_followups:
+                    break
+                if terminal_callback_sent:
+                    # A terminal callback can finish a racing execution while
+                    # other callbacks remain in the current history snapshot.
+                    # Check status without delaying a live peer on a history
+                    # fetch. Final assertions still use normal history polling.
+                    execution = get_durable_execution(execution_arn, self._lambda_client)
+                    if execution is None:
+                        errors.append("Failed to retrieve execution status before callback follow-up")
+                        return AsyncValidationResult(
+                            passed=False,
+                            errors=errors,
+                            callbacks_sent=callbacks_sent,
+                            final_status=final_status,
+                            event_count=len(actual_events),
+                        )
+                    if execution.get("Status") in _TERMINAL_STATUSES:
+                        # Keep dispatch closed even if history briefly lags the
+                        # terminal status returned by GetDurableExecution.
+                        execution_terminal = True
+                        break
 
                 # A heartbeat produces no history event. Dispatch its known
                 # follow-up in the next round before a potentially slow fetch.
                 callback_round = heartbeat_followups
                 initial_round = False
-
-            # In history-only mode, stop polling once all expected
-            # events are matched rather than waiting for terminal status.
-            if history_only_mode and expected_events:
-                matcher = EventHistoryMatcher(context=self._context)
-                match_result = matcher.match(expected_events, actual_events)
-                if match_result.success:
-                    return AsyncValidationResult(
-                        passed=True,
-                        errors=[],
-                        placeholders=match_result.resolved_placeholders,
-                        callbacks_sent=callbacks_sent,
-                        final_status=final_status,
-                        event_count=len(actual_events),
-                    )
 
         # --- Final assertion: match event history ---
         if expected_events:
